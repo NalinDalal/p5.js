@@ -1,7 +1,7 @@
 import * as DAG from './ir_dag'
 import * as CFG from './ir_cfg'
 import * as FES from './strands_FES'
-import { NodeType, OpCode, BaseType, DataType, BasePriority, OpCodeToSymbol, typeEquals, } from './ir_types';
+import { NodeType, OpCode, BaseType, DataType, BasePriority, OpCodeToSymbol, typeEquals, booleanOpCode } from './ir_types';
 import { createStrandsNode, StrandsNode } from './strands_node';
 import { strandsBuiltinFunctions } from './strands_builtins';
 
@@ -50,12 +50,22 @@ export function unaryOpNode(strandsContext, nodeOrValue, opCode) {
     node = createStrandsNode(id, dimension, strandsContext);
   }
   dependsOn = [node.id];
+
+  const typeInfo = {
+    baseType: dag.baseTypes[node.id],
+    dimension: node.dimension
+  };
+  if (booleanOpCode[opCode]) {
+    typeInfo.baseType = BaseType.BOOL;
+    typeInfo.dimension = 1;
+  }
+
   const nodeData = DAG.createNodeData({
     nodeType: NodeType.OPERATION,
     opCode,
     dependsOn,
-    baseType: dag.baseTypes[node.id],
-    dimension: node.dimension
+    baseType: typeInfo.baseType,
+    dimension: typeInfo.dimension
   })
   const id = DAG.getOrCreateNode(dag, nodeData);
   CFG.recordInBasicBlock(cfg, cfg.currentBlock, id);
@@ -76,8 +86,17 @@ export function binaryOpNode(strandsContext, leftStrandsNode, rightArg, opCode) 
   let finalRightNodeID = rightStrandsNode.id;
 
   // Check if we have to cast either node
-  const leftType = DAG.extractNodeTypeInfo(dag, leftStrandsNode.id);
-  const rightType = DAG.extractNodeTypeInfo(dag, rightStrandsNode.id);
+  let leftType = DAG.extractNodeTypeInfo(dag, leftStrandsNode.id);
+  let rightType = DAG.extractNodeTypeInfo(dag, rightStrandsNode.id);
+
+  // Update ASSIGN_ON_USE nodes to match the type of the other operand
+  if (leftType.baseType === BaseType.ASSIGN_ON_USE && rightType.baseType !== BaseType.ASSIGN_ON_USE) {
+    DAG.propagateTypeToAssignOnUse(dag, leftStrandsNode.id, rightType.baseType, rightType.dimension);
+    leftType = DAG.extractNodeTypeInfo(dag, leftStrandsNode.id);
+  } else if (rightType.baseType === BaseType.ASSIGN_ON_USE && leftType.baseType !== BaseType.ASSIGN_ON_USE) {
+    DAG.propagateTypeToAssignOnUse(dag, rightStrandsNode.id, leftType.baseType, leftType.dimension);
+    rightType = DAG.extractNodeTypeInfo(dag, rightStrandsNode.id);
+  }
   const cast = { node: null, toType: leftType };
   const bothDeferred = leftType.baseType === rightType.baseType && leftType.baseType === BaseType.DEFER;
   if (bothDeferred) {
@@ -135,6 +154,11 @@ export function binaryOpNode(strandsContext, leftStrandsNode, rightArg, opCode) 
       rightStrandsNode = createStrandsNode(casted.id, casted.dimension, strandsContext);
       finalRightNodeID = rightStrandsNode.id;
     }
+  }
+
+  if (booleanOpCode[opCode]) {
+    cast.toType.baseType = BaseType.BOOL;
+    cast.toType.dimension = 1;
   }
 
   const nodeData = DAG.createNodeData({
@@ -224,6 +248,17 @@ function mapPrimitiveDepsToIDs(strandsContext, typeInfo, dependsOn) {
       calculatedDimensions += dimension;
       continue;
     }
+    else if (typeof dep === 'boolean') {
+      // Handle boolean literals - convert to bool type
+      const { id, dimension } = scalarLiteralNode(strandsContext, { dimension: 1, baseType: BaseType.BOOL }, dep);
+      mappedDependencies.push(id);
+      calculatedDimensions += dimension;
+      // Update baseType to BOOL if it was inferred
+      if (baseType !== BaseType.BOOL) {
+        baseType = BaseType.BOOL;
+      }
+      continue;
+    }
     else {
       FES.userError('type error', `You've tried to construct a scalar or vector type with a non-numeric value: ${dep}`);
     }
@@ -274,7 +309,12 @@ export function primitiveConstructorNode(strandsContext, typeInfo, dependsOn) {
   const { mappedDependencies, inferredTypeInfo } = mapPrimitiveDepsToIDs(strandsContext, typeInfo, dependsOn);
 
   const finalType = {
-    baseType: typeInfo.baseType,
+    // We might have inferred a non numeric type. Currently this is
+    // just used for booleans. Maybe this needs to be something more robust
+    // if we ever want to support inference of e.g. int vectors?
+    baseType: inferredTypeInfo.baseType === BaseType.BOOL
+      ? BaseType.BOOL
+      : typeInfo.baseType,
     dimension: inferredTypeInfo.dimension
   };
 
